@@ -1,0 +1,37 @@
+# Local "realistic" run: real MQTT broker, three tiers in separate containers.
+version: "3.9"
+
+services:
+  broker:
+    image: eclipse-mosquitto:2
+    container_name: fog-broker
+    ports: ["1883:1883"]
+    volumes:
+      - ./config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+
+  backend:
+    build: { context: ., dockerfile: Dockerfile }
+    container_name: fog-backend
+    command: uvicorn backend.local.main:app --host 0.0.0.0 --port 8000
+    environment:
+      FOG_API_KEY: local-dev-key
+      QUEUE_WORKERS: "4"
+    ports: ["8000:8000"]
+
+  fog:
+    build: { context: ., dockerfile: Dockerfile }
+    container_name: fog-node
+    command: python -m fog.node
+    depends_on: [broker, backend]
+    environment:
+      FOG_MQTT_HOST: broker
+      FOG_INGEST_URL: http://backend:8000/api/ingest
+      FOG_API_KEY: local-dev-key
+
+  sensors:
+    build: { context: ., dockerfile: Dockerfile }
+    container_name: fog-sensors
+    command: python -m sensors.runner
+    depends_on: [broker, fog]
+    environment:
+      FOG_MQTT_HOST: broker

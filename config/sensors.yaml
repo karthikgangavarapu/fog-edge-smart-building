@@ -1,0 +1,82 @@
+# ---------------------------------------------------------------------------
+# Sensor fleet definition.
+#
+# sample_hz      : how often the sensor TAKES a reading   (frequency)
+# dispatch_every : how many readings it BATCHES before publishing (dispatch rate)
+#
+# The two are independent on purpose - e.g. the power meter samples 10x/s but
+# only publishes once per 20 samples (2 msg/s), while occupancy samples slowly
+# and publishes every reading because each event matters.
+# ---------------------------------------------------------------------------
+transport:
+  kind: inproc          # inproc | mqtt
+  host: localhost
+  port: 1883
+  topic_prefix: building/hq
+
+fog:
+  fog_id: fog-hq-01
+  window_seconds: 5           # aggregation window
+  dispatch_interval_s: 5      # how often a batch is shipped to the cloud
+  max_batch_readings: 500
+  thin_raw_to: 20             # raw samples kept per window for charting
+  anomaly:
+    zscore_threshold: 3.0
+    min_history: 20
+    cooldown_s: 10            # suppress repeats of the same alert for 10 s
+  buffer_path: ./fog_spool.db  # store-and-forward when cloud is unreachable
+
+cloud:
+  ingest_url: http://localhost:8000/api/ingest
+  api_key: local-dev-key
+  timeout_s: 10
+  max_retries: 5
+
+sensors:
+  - id: temp-f2-east-01
+    type: temperature
+    zone: floor-2-east
+    sample_hz: 1.0
+    dispatch_every: 5
+    noise: 0.15
+    fault_rate: 0.01
+
+  - id: temp-f3-west-01
+    type: temperature
+    zone: floor-3-west
+    sample_hz: 1.0
+    dispatch_every: 5
+    noise: 0.2
+    fault_rate: 0.02
+
+  - id: hum-f2-east-01
+    type: humidity
+    zone: floor-2-east
+    sample_hz: 0.5
+    dispatch_every: 2
+    noise: 0.8
+    fault_rate: 0.01
+
+  - id: co2-f2-east-01
+    type: co2
+    zone: floor-2-east
+    sample_hz: 0.5
+    dispatch_every: 2
+    noise: 6.0
+    fault_rate: 0.01
+
+  - id: occ-f2-east-01
+    type: occupancy
+    zone: floor-2-east
+    sample_hz: 0.5
+    dispatch_every: 1
+    noise: 0.0
+    fault_rate: 0.005
+
+  - id: pwr-ahu-01
+    type: power
+    zone: plant-room
+    sample_hz: 10.0
+    dispatch_every: 20
+    noise: 25.0
+    fault_rate: 0.005

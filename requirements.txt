@@ -1,0 +1,12 @@
+# Sensor + fog tier (the fog node itself needs only the stdlib + these two)
+paho-mqtt==1.6.1
+PyYAML==6.0.1
+
+# Local backend (cloud deployment uses backend/azure_functions/requirements.txt)
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+
+# Dev / CI
+pytest==8.1.1
+httpx==0.27.0
+locust==2.24.0

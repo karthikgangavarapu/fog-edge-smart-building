@@ -1,0 +1,98 @@
+name: CI/CD
+
+# Pull requests are tested only; pushes to main are tested and then deployed.
+on:
+  push: { branches: [main] }
+  pull_request: { branches: [main] }
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11"
+  FUNCTIONS_PACKAGE_PATH: backend/azure_functions
+
+jobs:
+  test:
+    name: Lint & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff
+      - name: Lint
+        run: ruff check sensors fog backend tests --select E9,F63,F7,F82
+      - name: Unit & integration tests
+        run: pytest -q --junitxml=test-results.xml
+      - name: Publish test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: test-results, path: test-results.xml }
+
+  e2e:
+    name: End-to-end pipeline smoke test
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -r requirements.txt
+      - name: Start backend
+        run: |
+          uvicorn backend.local.main:app --port 8000 &
+          for i in $(seq 1 20); do curl -sf localhost:8000/api/health && break; sleep 1; done
+      - name: Run sensors + fog for 30s against the backend
+        run: python run_demo.py --seconds 30 --ingest http://localhost:8000/api/ingest
+      - name: Assert data landed in the backend
+        run: |
+          python - <<'PY'
+          import json, sys, urllib.request
+          m = json.load(urllib.request.urlopen("http://localhost:8000/api/metrics"))
+          print(m)
+          assert m["batches"] > 0, "no batches persisted"
+          assert m["aggregates"] > 0, "no aggregates persisted"
+          assert m["rejected"] == 0, "backend rejected messages"
+          PY
+      - name: Measure fog data reduction
+        run: python -m loadtest.benchmark reduction --seconds 20
+
+  deploy:
+    name: Deploy to Azure
+    runs-on: ubuntu-latest
+    needs: [test, e2e]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Azure login (OIDC federated credential - no stored secrets)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Provision / update infrastructure
+        run: |
+          az deployment group create -g ${{ secrets.AZURE_RG }} \
+            -f infra/main.bicep \
+            -p namePrefix=fogedge apiKey=${{ secrets.FOG_API_KEY }}
+      - name: Install function dependencies
+        run: pip install -r ${{ env.FUNCTIONS_PACKAGE_PATH }}/requirements.txt --target=${{ env.FUNCTIONS_PACKAGE_PATH }}/.python_packages/lib/site-packages
+      - name: Deploy Function App
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ secrets.AZURE_FUNCTIONAPP_NAME }}
+          package: ${{ env.FUNCTIONS_PACKAGE_PATH }}
+          scm-do-build-during-deployment: true
+          enable-oryx-build: true
+      - name: Post-deploy smoke test
+        run: |
+          URL=https://${{ secrets.AZURE_FUNCTIONAPP_NAME }}.azurewebsites.net
+          curl -sf "$URL/api/summary" > /dev/null && echo "cloud backend healthy"

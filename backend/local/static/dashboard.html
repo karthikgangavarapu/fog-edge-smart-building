@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Smart Building Fog and Edge Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root{--bg:#0d1117;--panel:#161b22;--line:#26303d;--fg:#e6edf3;--mut:#8b949e;
+        --ok:#3fb950;--warn:#d29922;--crit:#f85149;--accent:#58a6ff;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  header{padding:16px 20px;border-bottom:1px solid var(--line);display:flex;
+         flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between}
+  h1{font-size:17px;margin:0;font-weight:600}
+  .pill{background:var(--panel);border:1px solid var(--line);border-radius:999px;
+        padding:4px 12px;font-size:12px;color:var(--mut)}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;
+       background:var(--ok);margin-right:6px}
+  main{padding:20px;max-width:1500px;margin:0 auto}
+  .grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+  .card h3{margin:0 0 4px;font-size:12px;text-transform:uppercase;
+           letter-spacing:.06em;color:var(--mut);font-weight:600}
+  .val{font-size:28px;font-weight:650;letter-spacing:-.5px}
+  .val span{font-size:14px;color:var(--mut);font-weight:400;margin-left:4px}
+  .sub{font-size:12px;color:var(--mut);margin-top:2px}
+  .charts{display:grid;gap:14px;margin-top:18px;
+          grid-template-columns:repeat(auto-fit,minmax(380px,1fr))}
+  .chartbox{background:var(--panel);border:1px solid var(--line);
+            border-radius:10px;padding:14px;height:260px}
+  .chartbox canvas{max-height:200px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line)}
+  th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase}
+  .sev{font-size:11px;padding:2px 8px;border-radius:999px;font-weight:600}
+  .warning{background:rgba(210,153,34,.15);color:var(--warn)}
+  .critical{background:rgba(248,81,73,.15);color:var(--crit)}
+  .section{margin-top:22px}
+  .section h2{font-size:14px;margin:0 0 10px;color:var(--mut);
+              text-transform:uppercase;letter-spacing:.06em}
+  @media(max-width:640px){.val{font-size:22px}main{padding:12px}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Smart Building Fog and Edge Telemetry</h1>
+  <div>
+    <span class="pill"><span class="dot" id="dot"></span><span id="status">connecting…</span></span>
+    <span class="pill" id="qdepth">queue 0</span>
+    <span class="pill" id="batches">batches 0</span>
+  </div>
+</header>
+
+<main>
+  <div class="section">
+    <h2>Live sensor values</h2>
+    <div class="grid" id="cards"></div>
+  </div>
+
+  <div class="section">
+    <h2>Trends (fog-aggregated windows)</h2>
+    <div class="charts" id="charts"></div>
+  </div>
+
+  <div class="section">
+    <h2>Anomalies detected at the fog tier</h2>
+    <div class="card"><table id="anoms">
+      <thead><tr><th>Time</th><th>Sensor</th><th>Zone</th><th>Kind</th>
+                 <th>Value</th><th>Severity</th></tr></thead>
+      <tbody></tbody></table></div>
+  </div>
+</main>
+
+<script>
+const REFRESH_MS = 3000;
+const COLORS = ['#58a6ff','#3fb950','#d29922','#f85149','#bc8cff','#39c5cf'];
+const charts = {};
+
+const fmtTime = ms => new Date(ms).toLocaleTimeString();
+
+async function get(path){
+  const r = await fetch(path, {cache:'no-store'});
+  if(!r.ok) throw new Error(path + ' -> ' + r.status);
+  return r.json();
+}
+
+function renderCards(latest){
+  // one card per (sensor_type, zone) showing the most recent window
+  document.getElementById('cards').innerHTML = latest.map(a => `
+    <div class="card">
+      <h3>${a.sensor_type} · ${a.zone}</h3>
+      <div class="val">${Number(a.last).toFixed(1)}<span>${a.unit||''}</span></div>
+      <div class="sub">mean ${Number(a.mean).toFixed(1)} ·
+           min ${Number(a.min).toFixed(1)} · max ${Number(a.max).toFixed(1)}</div>
+      <div class="sub">${a.count} samples · ${fmtTime(a.window_end)}</div>
+    </div>`).join('') || '<div class="card"><div class="sub">Waiting for fog data…</div></div>';
+}
+
+function ensureChart(type){
+  if(charts[type]) return charts[type];
+  const box = document.createElement('div');
+  box.className = 'chartbox';
+  box.innerHTML = `<h3 style="margin:0 0 8px;font-size:12px;text-transform:uppercase;
+      letter-spacing:.06em;color:#8b949e">${type}</h3><canvas></canvas>`;
+  document.getElementById('charts').appendChild(box);
+  const ctx = box.querySelector('canvas').getContext('2d');
+  charts[type] = new Chart(ctx, {
+    type:'line',
+    data:{labels:[],datasets:[]},
+    options:{
+      responsive:true, maintainAspectRatio:false, animation:false,
+      interaction:{intersect:false,mode:'index'},
+      plugins:{legend:{labels:{color:'#8b949e',boxWidth:10,font:{size:11}}}},
+      scales:{
+        x:{ticks:{color:'#8b949e',maxTicksLimit:6,font:{size:10}},grid:{color:'#26303d'}},
+        y:{ticks:{color:'#8b949e',font:{size:10}},grid:{color:'#26303d'}}
+      }
+    }
+  });
+  return charts[type];
+}
+
+async function renderChart(type){
+  const {points} = await get('/api/series/' + type + '?limit=60');
+  const byZone = {};
+  points.forEach(p => (byZone[p.zone] = byZone[p.zone] || []).push(p));
+  const labels = [...new Set(points.map(p => fmtTime(p.ts)))];
+  const chart = ensureChart(type);
+  chart.data.labels = labels;
+  chart.data.datasets = Object.entries(byZone).map(([zone, pts], i) => ({
+    label: zone,
+    data: pts.map(p => p.mean),
+    borderColor: COLORS[i % COLORS.length],
+    backgroundColor: COLORS[i % COLORS.length] + '22',
+    borderWidth: 2, pointRadius: 0, tension: .3, fill: true
+  }));
+  chart.update('none');
+}
+
+function renderAnoms(rows){
+  document.querySelector('#anoms tbody').innerHTML = rows.length ? rows.map(a => `
+    <tr><td>${fmtTime(a.ts)}</td><td>${a.sensor_id}</td><td>${a.zone}</td>
+        <td>${a.kind.replace(/_/g,' ')}</td><td>${Number(a.value).toFixed(1)}</td>
+        <td><span class="sev ${a.severity}">${a.severity}</span></td></tr>`).join('')
+    : '<tr><td colspan="6" style="color:#8b949e">No anomalies in the current window.</td></tr>';
+}
+
+async function tick(){
+  try{
+    const [sum, anom, met] = await Promise.all([
+      get('/api/summary'), get('/api/anomalies?limit=25'), get('/api/metrics')
+    ]);
+    renderCards(sum.latest);
+    await Promise.all(sum.types.map(renderChart));
+    renderAnoms(anom.anomalies);
+    document.getElementById('status').textContent = 'live';
+    document.getElementById('dot').style.background = 'var(--ok)';
+    document.getElementById('qdepth').textContent = 'queue ' + met.queue_depth;
+    document.getElementById('batches').textContent = met.batches + ' batches · '
+        + met.duplicates + ' dedup';
+  }catch(e){
+    document.getElementById('status').textContent = 'backend unreachable';
+    document.getElementById('dot').style.background = 'var(--crit)';
+  }
+}
+tick();
+setInterval(tick, REFRESH_MS);
+</script>
+</body>
+</html>
