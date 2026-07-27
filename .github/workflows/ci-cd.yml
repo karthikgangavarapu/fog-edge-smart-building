@@ -51,15 +51,7 @@ jobs:
       - name: Run sensors + fog for 30s against the backend
         run: python run_demo.py --seconds 30 --ingest http://localhost:8000/api/ingest
       - name: Assert data landed in the backend
-        run: |
-          python - <<'PY'
-          import json, urllib.request
-          m = json.load(urllib.request.urlopen("http://localhost:8000/api/metrics"))
-          print(m)
-          assert m["batches"] > 0, "no batches persisted"
-          assert m["aggregates"] > 0, "no aggregates persisted"
-          assert m["rejected"] == 0, "backend rejected messages"
-          PY
+        run: python scripts/assert_pipeline.py http://localhost:8000/api/metrics
       - name: Measure fog data reduction
         run: python -m loadtest.benchmark reduction --seconds 20
 
@@ -78,7 +70,13 @@ jobs:
     name: Deploy to AWS
     runs-on: ubuntu-latest
     needs: [test, e2e, validate-infra]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # Skipped, not failed, until the AWS deployment role is configured in
+    # repository secrets. A pipeline that goes red because an optional secret
+    # is absent trains you to ignore red pipelines.
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'push' &&
+      vars.AWS_DEPLOY_ENABLED == 'true'
     environment: production
     # Required for OIDC: GitHub mints a short-lived token and assumes an AWS
     # role, so no long-lived access key is ever stored in the repository.
