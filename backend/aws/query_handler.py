@@ -46,18 +46,18 @@ def _json(body, status: int = 200) -> dict:
 
 def _zones_for(sensor_type: str) -> list:
     """
-    Zones are discovered from the aggregate partitions rather than configured,
-    so adding a zone to the fog tier needs no cloud-side change.
+    Zones are discovered from the registry partition rather than configured, so
+    adding a zone to the fog tier needs no cloud-side change.
+
+    This is a single-partition Query. An earlier version used a bounded Scan
+    with a filter and silently returned only some sensor types, because
+    DynamoDB applies Limit to items examined, not to items matched.
     """
-    seen = set()
-    resp = table.scan(
-        ProjectionExpression="PK",
-        FilterExpression=Key("PK").begins_with(f"AGG#{sensor_type}#"),
-        Limit=200,
+    resp = table.query(
+        KeyConditionExpression=Key("PK").eq("ZONES")
+                               & Key("SK").begins_with(f"{sensor_type}#"),
     )
-    for item in resp.get("Items", []):
-        seen.add(item["PK"].split("#", 2)[2])
-    return sorted(seen)
+    return sorted({item["SK"].split("#", 1)[1] for item in resp.get("Items", [])})
 
 
 def _latest(sensor_type: str, zone: str):

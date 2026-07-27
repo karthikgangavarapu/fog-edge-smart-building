@@ -14,9 +14,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend" / "aws"))
 from documents import RAW_TTL_SECONDS, build_items, from_decimal, to_decimal
 
 
-def envelope():
+def envelope(batch_id="b1"):
     return {
-        "batch_id": "b1", "fog_id": "fog-test", "schema_version": "1.0",
+        "batch_id": batch_id, "fog_id": "fog-test", "schema_version": "1.0",
         "window_start": 1000, "window_end": 6000,
         "aggregates": [{"sensor_type": "temperature", "zone": "z1", "unit": "C",
                         "count": 5, "min": 20.0, "max": 22.0, "mean": 21.0,
@@ -33,8 +33,18 @@ def envelope():
 
 def test_one_item_per_record():
     items = build_items(envelope(), now_epoch=1_700_000_000)
-    assert len(items) == 3
-    assert {i["doc_type"] for i in items} == {"aggregate", "anomaly", "raw"}
+    assert len(items) == 4          # aggregate, anomaly, raw, plus the registry
+    assert {i["doc_type"] for i in items} == {"aggregate", "anomaly", "raw", "zone"}
+
+
+def test_registry_item_lets_the_dashboard_discover_series():
+    """
+    The dashboard needs to know which (type, zone) pairs exist. Scanning for
+    them misses partitions, so every aggregate re-asserts a registry entry.
+    """
+    items = build_items(envelope(), now_epoch=0)
+    reg = next(i for i in items if i["doc_type"] == "zone")
+    assert reg["PK"] == "ZONES" and reg["SK"] == "temperature#z1"
 
 
 def test_partition_keys_group_by_type_and_zone():
@@ -47,10 +57,13 @@ def test_partition_keys_group_by_type_and_zone():
 def test_sort_keys_are_zero_padded_for_time_ordering():
     """Lexical order must equal chronological order, or the charts scramble."""
     env = envelope()
+    def agg_sk(items):
+        return next(i["SK"] for i in items if i["doc_type"] == "aggregate")
+
     env["aggregates"][0]["window_end"] = 999
-    early = build_items(env, now_epoch=0)[0]["SK"]
+    early = agg_sk(build_items(env, now_epoch=0))
     env["aggregates"][0]["window_end"] = 1_700_000_000_000
-    late = build_items(env, now_epoch=0)[0]["SK"]
+    late = agg_sk(build_items(env, now_epoch=0))
     assert early < late
 
 
@@ -72,6 +85,13 @@ def test_identical_records_produce_identical_keys():
 
 def test_empty_envelope_produces_nothing():
     assert build_items({"batch_id": "x", "aggregates": []}, now_epoch=0) == []
+
+
+def test_registry_keys_are_stable_across_batches():
+    """Re-asserting the registry must overwrite, never accumulate duplicates."""
+    a = [i for i in build_items(envelope("b1"), 0) if i["doc_type"] == "zone"]
+    b = [i for i in build_items(envelope("b2"), 0) if i["doc_type"] == "zone"]
+    assert [(i["PK"], i["SK"]) for i in a] == [(i["PK"], i["SK"]) for i in b]
 
 
 def test_floats_are_converted_for_dynamodb():

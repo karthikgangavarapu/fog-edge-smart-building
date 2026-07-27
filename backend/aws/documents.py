@@ -14,6 +14,7 @@ One DynamoDB table holds three item types, separated by the partition key:
     ANOM#<sensor_type>          <ts>#<sensor_id>      one anomaly event
     RAW#<sensor_type>           <ts>#<sensor_id>      a thinned raw sample
     BATCH#<batch_id>            META                  idempotency ledger entry
+    ZONES                       <sensor_type>#<zone>  registry of live series
 
 The dashboard only ever queries by (sensor_type, zone) ordered by time, which
 is exactly a single-partition Query. That is the cheapest read DynamoDB offers
@@ -33,6 +34,17 @@ def build_items(envelope: Dict[str, Any], now_epoch: int) -> List[Dict[str, Any]
     items: List[Dict[str, Any]] = []
 
     for a in envelope.get("aggregates", []):
+        # Registry entry so the dashboard can discover which (type, zone) pairs
+        # exist with one cheap Query. Discovering them with a Scan does not
+        # work: DynamoDB applies Limit before the filter, so a bounded scan
+        # over a busy table silently misses most partitions.
+        items.append({
+            "PK": "ZONES",
+            "SK": f"{a['sensor_type']}#{a['zone']}",
+            "doc_type": "zone",
+            "sensor_type": a["sensor_type"], "zone": a["zone"],
+            "unit": a.get("unit", ""),
+        })
         items.append({
             "PK": f"AGG#{a['sensor_type']}#{a['zone']}",
             # window_end is zero padded so lexical sort equals time order
