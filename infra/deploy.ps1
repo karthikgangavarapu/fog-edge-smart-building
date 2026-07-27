@@ -25,10 +25,6 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 
-if ([string]::IsNullOrWhiteSpace($ApiKey)) {
-    $ApiKey = -join ((1..32) | ForEach-Object { "0123456789abcdef"[(Get-Random -Maximum 16)] })
-}
-
 Write-Host "==> checking the AWS CLI and your credentials" -ForegroundColor Cyan
 if (-not (Get-Command aws -ErrorAction SilentlyContinue)) {
     throw "The AWS CLI is not on PATH. Install it from https://awscli.amazonaws.com/AWSCLIV2.msi"
@@ -36,6 +32,21 @@ if (-not (Get-Command aws -ErrorAction SilentlyContinue)) {
 $identity = aws sts get-caller-identity --output json 2>$null | ConvertFrom-Json
 if (-not $identity) { throw "No valid AWS credentials. Run 'aws configure' first." }
 Write-Host "    account $($identity.Account) as $($identity.Arn)"
+
+# Reuse the key already deployed, if any. Minting a fresh one on every deploy
+# silently invalidates the key the fog nodes are holding, which shows up as a
+# flood of 401s rather than as anything obviously key-related.
+if ([string]::IsNullOrWhiteSpace($ApiKey)) {
+    $ApiKey = aws lambda get-function-configuration --function-name "$StackName-ingest" `
+                --region $Region --query "Environment.Variables.FOG_API_KEY" `
+                --output text 2>$null
+}
+if ([string]::IsNullOrWhiteSpace($ApiKey) -or $ApiKey -eq "None") {
+    $ApiKey = -join ((1..32) | ForEach-Object { "0123456789abcdef"[(Get-Random -Maximum 16)] })
+    Write-Host "    generated a new API key"
+} else {
+    Write-Host "    reusing the API key already deployed"
+}
 
 # --------------------------------------------------------------- packaging
 # Every handler and the dashboard page go in one zip. boto3 ships with the

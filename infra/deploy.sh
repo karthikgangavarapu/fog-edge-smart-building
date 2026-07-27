@@ -8,13 +8,27 @@ set -euo pipefail
 
 STACK="${STACK:-fogedge}"
 REGION="${REGION:-us-east-1}"
-API_KEY="${API_KEY:-$(openssl rand -hex 16)}"
 LAB_ROLE_ARN="${LAB_ROLE_ARN:-}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 command -v aws >/dev/null || { echo "AWS CLI not found"; exit 1; }
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 echo "==> account $ACCOUNT, region $REGION"
+
+# Reuse the key already deployed, if any. Minting a fresh one on every deploy
+# silently invalidates the key the fog nodes are holding, which shows up as a
+# flood of 401s rather than as anything obviously key-related.
+if [ -z "${API_KEY:-}" ]; then
+  API_KEY=$(aws lambda get-function-configuration --function-name "$STACK-ingest" \
+              --region "$REGION" --query "Environment.Variables.FOG_API_KEY" \
+              --output text 2>/dev/null || true)
+fi
+if [ -z "$API_KEY" ] || [ "$API_KEY" = "None" ]; then
+  API_KEY=$(openssl rand -hex 16)
+  echo "==> generated a new API key"
+else
+  echo "==> reusing the API key already deployed"
+fi
 
 BUCKET="$STACK-code-$ACCOUNT-$REGION"
 ZIP="$(mktemp -d)/lambda.zip"
