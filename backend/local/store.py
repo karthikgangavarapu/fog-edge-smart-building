@@ -1,9 +1,10 @@
 """
 Persistence for the local/dev backend.
 
-SQLite is used here as a stand-in for Azure Cosmos DB. The access pattern is
-deliberately identical to the Cosmos one (partition by zone+sensor_type, sort
-by timestamp) so the cloud implementation is a driver swap, not a rewrite.
+SQLite is used here as a stand-in for Amazon DynamoDB. The access pattern is
+deliberately identical to the DynamoDB one (partition by sensor_type and zone,
+sort by timestamp) so the cloud implementation is a driver swap, not a
+rewrite.
 """
 from __future__ import annotations
 

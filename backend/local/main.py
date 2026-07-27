@@ -1,13 +1,13 @@
 """
-Local backend: a faithful, dependency-light mirror of the Azure deployment.
+Local backend: a faithful, dependency-light mirror of the AWS deployment.
 
 Cloud mapping
 -------------
-    FastAPI  POST /api/ingest      <->  Azure Function (HTTP trigger) "ingest"
-    asyncio.Queue                  <->  Azure Service Bus queue "telemetry"
-    _worker() consumer task        <->  Azure Function (Service Bus trigger) "processor"
-    SQLite Store                   <->  Azure Cosmos DB (SQL API)
-    /api/* read endpoints          <->  Azure Function (HTTP trigger) "query"
+    FastAPI  POST /api/ingest      <->  API Gateway + Lambda "ingest"
+    asyncio.Queue                  <->  Amazon SQS queue "telemetry"
+    _worker() consumer task        <->  Lambda "processor" (SQS event source)
+    SQLite Store                   <->  Amazon DynamoDB (single table)
+    /api/* read endpoints          <->  API Gateway + Lambda "query"
 
 Keeping the two in lock-step means the demo can be run offline and the cloud
 version can be validated against the same test-suite.
@@ -34,7 +34,7 @@ WORKERS = int(os.environ.get("QUEUE_WORKERS", "4"))
 app = FastAPI(title="Fog & Edge Smart-Building Backend", version="1.0.0")
 store = Store(os.environ.get("BACKEND_DB", "./backend.db"))
 
-# The in-process queue stands in for Service Bus. It is what decouples the
+# The in-process queue stands in for Amazon SQS. It is what decouples the
 # latency of ingest (must be fast, the fog node is waiting) from the latency of
 # persistence (can be slow, can be retried, can be scaled independently).
 # Created on startup, not at import time, so it binds to the running event loop.
@@ -54,8 +54,8 @@ async def _worker(worker_id: int) -> None:
             if not applied:
                 METRICS["duplicates"] += 1
         except Exception:
-            # In Azure this is where the message would be abandoned and
-            # eventually dead-lettered after maxDeliveryCount attempts.
+            # On AWS this is where the message would be returned to SQS and
+            # eventually dead-lettered after maxReceiveCount attempts.
             METRICS["rejected"] += 1
         finally:
             queue.task_done()

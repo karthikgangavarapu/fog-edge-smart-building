@@ -1,0 +1,267 @@
+# ---------------------------------------------------------------------------
+# Fog & Edge smart-building backend, AWS infrastructure as code.
+#
+#   API Gateway (HTTP API)  public entry point for the fog nodes and browser
+#   Lambda: ingest          validates and enqueues, returns 202
+#   SQS: telemetry          durable buffer, and the Lambda scaling signal
+#   SQS: telemetry-dlq      dead letters after maxReceiveCount
+#   Lambda: processor       queue triggered, writes to DynamoDB
+#   DynamoDB: telemetry     single table, on-demand billing, TTL on raw items
+#   Lambda: query           read models plus the dashboard page
+#   CloudWatch Logs         traces and metrics for every function
+#
+# Plain CloudFormation rather than SAM so it deploys with nothing but the AWS
+# CLI. Set ExistingRoleArn to your LabRole if you are on AWS Academy and
+# cannot create IAM roles.
+#
+#   aws cloudformation deploy --template-file infra/template.yaml \
+#       --stack-name fogedge --capabilities CAPABILITY_IAM \
+#       --parameter-overrides CodeBucket=<bucket> CodeKey=lambda.zip ApiKey=<secret>
+# ---------------------------------------------------------------------------
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Three-tier fog and edge telemetry backend (sensors, fog node, cloud)
+
+Parameters:
+  CodeBucket:
+    Type: String
+    Description: S3 bucket holding the Lambda deployment package.
+  CodeKey:
+    Type: String
+    Default: lambda.zip
+    Description: S3 key of the Lambda deployment package.
+  ApiKey:
+    Type: String
+    NoEcho: true
+    Description: Shared secret the fog nodes send in the X-Api-Key header.
+  ExistingRoleArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional. On AWS Academy set this to the LabRole ARN, since the lab
+      account cannot create IAM roles. Leave blank in a normal account and the
+      stack creates a least-privilege role of its own.
+
+Conditions:
+  CreateRole: !Equals [!Ref ExistingRoleArn, ""]
+
+Resources:
+
+  # ------------------------------------------------------------- messaging
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-telemetry-dlq"
+      MessageRetentionPeriod: 1209600      # 14 days, the maximum
+
+  TelemetryQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-telemetry"
+      # Must be at least the processor timeout, or a slow message becomes
+      # visible again while it is still being handled and gets processed twice.
+      VisibilityTimeout: 90
+      MessageRetentionPeriod: 345600       # 4 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        # A message that fails five times is poisonous. Move it aside rather
+        # than letting it block the consumer group forever.
+        maxReceiveCount: 5
+
+  # -------------------------------------------------------------- storage
+  TelemetryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-telemetry"
+      # On-demand: no capacity to plan, scales with the burst, costs nothing
+      # while the building is quiet.
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      # Raw chart traces expire after an hour; aggregates are kept forever.
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+
+  # ------------------------------------------------------------------ IAM
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: telemetry-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Only the two queues and the one table, nothing wider.
+              - Effect: Allow
+                Action: [sqs:SendMessage, sqs:ReceiveMessage, sqs:DeleteMessage,
+                         sqs:GetQueueAttributes]
+                Resource: [!GetAtt TelemetryQueue.Arn, !GetAtt DeadLetterQueue.Arn]
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:BatchWriteItem, dynamodb:GetItem,
+                         dynamodb:Query, dynamodb:Scan]
+                Resource: !GetAtt TelemetryTable.Arn
+
+  # ------------------------------------------------------------- functions
+  IngestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-ingest"
+      Runtime: python3.12
+      Handler: ingest_handler.handler
+      Role: !If [CreateRole, !GetAtt LambdaRole.Arn, !Ref ExistingRoleArn]
+      Timeout: 15
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+      Environment:
+        Variables:
+          TELEMETRY_QUEUE_URL: !Ref TelemetryQueue
+          FOG_API_KEY: !Ref ApiKey
+
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-processor"
+      Runtime: python3.12
+      Handler: processor_handler.handler
+      Role: !If [CreateRole, !GetAtt LambdaRole.Arn, !Ref ExistingRoleArn]
+      Timeout: 60
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TelemetryTable
+
+  QueryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-query"
+      Runtime: python3.12
+      Handler: query_handler.handler
+      Role: !If [CreateRole, !GetAtt LambdaRole.Arn, !Ref ExistingRoleArn]
+      Timeout: 30
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TelemetryTable
+
+  # The event source mapping is what makes Lambda poll SQS and scale the
+  # number of concurrent processors with the visible backlog.
+  ProcessorEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt TelemetryQueue.Arn
+      FunctionName: !GetAtt ProcessorFunction.Arn
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      # Report per-message failures so one bad batch does not force the
+      # redelivery of the good ones next to it.
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig:
+        MaximumConcurrency: 20
+
+  # ---------------------------------------------------------------- HTTP
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: ["*"]
+
+  IngestIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt IngestFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  QueryIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt QueryFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  IngestRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /api/ingest
+      Target: !Sub "integrations/${IngestIntegration}"
+
+  QueryRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /api/{proxy+}
+      Target: !Sub "integrations/${QueryIntegration}"
+
+  RootRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /
+      Target: !Sub "integrations/${QueryIntegration}"
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+
+  IngestPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IngestFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*"
+
+  QueryPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QueryFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*"
+
+Outputs:
+  IngestUrl:
+    Description: Point the fog node at this with FOG_INGEST_URL.
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/api/ingest"
+  DashboardUrl:
+    Description: Open this in a browser.
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/api/dashboard"
+  QueueUrl:
+    Value: !Ref TelemetryQueue
+  TableName:
+    Value: !Ref TelemetryTable

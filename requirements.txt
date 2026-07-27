@@ -2,7 +2,8 @@
 paho-mqtt==1.6.1
 PyYAML==6.0.1
 
-# Local backend (cloud deployment uses backend/azure_functions/requirements.txt)
+# Local backend (the Lambda runtime already ships boto3, so the cloud
+# deployment package needs no third-party dependencies at all)
 fastapi==0.110.0
 uvicorn[standard]==0.29.0
 

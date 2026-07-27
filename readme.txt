@@ -1,21 +1,21 @@
 ================================================================================
  FOG & EDGE COMPUTING CA - SMART BUILDING TELEMETRY PLATFORM
- Sensor tier -> Fog tier -> Scalable cloud backend (Microsoft Azure)
+ Sensor tier -> Fog tier -> Scalable cloud backend (Amazon Web Services)
 ================================================================================
 
 CONTENTS
 --------
-  sensors/                 Five virtual sensor types + MQTT/in-process transport
-  fog/                     Virtual fog node: validate, smooth, aggregate,
-                           detect anomalies, spool and dispatch to the cloud
-  backend/local/           FastAPI backend (local mirror of the Azure design)
-  backend/azure_functions/ Azure Functions v2 app (HTTP + Service Bus + Cosmos)
-  infra/                   Bicep IaC template and deploy.sh
-  tests/                   23 pytest unit + integration tests
-  loadtest/                Data-reduction and ingest-throughput benchmarks
-  config/sensors.yaml      All frequency / dispatch-rate / threshold settings
-  run_demo.py              One-command end-to-end demo (no broker required)
-  docker-compose.yml       Four-container demo with a real Mosquitto broker
+  sensors/            Five virtual sensor types + MQTT/in-process transport
+  fog/                Virtual fog node: validate, smooth, aggregate, detect
+                      anomalies, spool and dispatch to the cloud
+  backend/local/      FastAPI backend (local mirror of the AWS design)
+  backend/aws/        Lambda handlers: ingest, processor, query + dashboard
+  infra/              CloudFormation template and deploy scripts
+  tests/              31 pytest unit + integration tests
+  loadtest/           Data-reduction and ingest-throughput benchmarks
+  config/sensors.yaml All frequency / dispatch-rate / threshold settings
+  run_demo.py         One-command end-to-end demo (no broker required)
+  docker-compose.yml  Four-container demo with a real Mosquitto broker
 
 
 --------------------------------------------------------------------------------
@@ -25,7 +25,7 @@ CONTENTS
   * pip
   Optional:
   * Docker + Docker Compose  (for the MQTT-broker version of the demo)
-  * Azure CLI + Azure Functions Core Tools v4  (for the cloud deployment)
+  * AWS CLI v2               (for the cloud deployment)
 
 
 --------------------------------------------------------------------------------
@@ -72,7 +72,7 @@ CONTENTS
 --------------------------------------------------------------------------------
 5. RUNNING THE TESTS
 --------------------------------------------------------------------------------
-      pytest -q                    # 23 tests, expect all passing
+      pytest -q                    # 31 tests, expect all passing
 
   NOTE: run the tests from a normal local disk. SQLite does not work on some
   network/cloud-synced folders (OneDrive, Google Drive) and will report
@@ -92,28 +92,50 @@ CONTENTS
 
 
 --------------------------------------------------------------------------------
-7. DEPLOYING TO AZURE
+7. DEPLOYING TO AWS
 --------------------------------------------------------------------------------
-      az login
-      export RG=rg-fogedge LOCATION=northeurope
+  Configure credentials once:
+
+      aws configure
+
+  On AWS Academy, copy the keys from "AWS Details" on the lab page into
+  %USERPROFILE%\.aws\credentials (Windows) or ~/.aws/credentials, including
+  the aws_session_token line. Those credentials expire when the lab session
+  ends, so re-copy them if a deploy suddenly fails with an auth error.
+
+  Windows (PowerShell):
+      .\infra\deploy.ps1
+      .\infra\deploy.ps1 -Region us-east-1 -StackName fogedge
+
+  macOS / Linux:
       ./infra/deploy.sh
 
-  The script provisions (via infra/main.bicep):
-      - Function App on the Consumption plan (event-driven autoscale)
-      - Service Bus namespace + "telemetry" queue (durable buffer)
-      - Cosmos DB serverless account, database "telemetry", container
-        "readings" partitioned on /zone
-      - Application Insights + the storage account the runtime requires
-  ...then publishes backend/azure_functions and prints the ingest URL, the
-  dashboard URL and the generated API key.
+  On AWS Academy you cannot create IAM roles, so pass the lab role instead:
+      .\infra\deploy.ps1 -LabRoleArn arn:aws:iam::<account-id>:role/LabRole
+      LAB_ROLE_ARN=arn:aws:iam::<account-id>:role/LabRole ./infra/deploy.sh
 
-  Point the fog node at the cloud:
-      export FOG_INGEST_URL=https://<app>.azurewebsites.net/api/ingest
-      export FOG_API_KEY=<key printed by deploy.sh>
+  The script packages backend/aws into a zip, uploads it to S3 and deploys
+  infra/template.yaml, which creates:
+      - API Gateway HTTP API (public entry point)
+      - Lambda "ingest"    (validates and enqueues, returns 202)
+      - SQS queue "telemetry" + a dead-letter queue
+      - Lambda "processor" (SQS triggered, scales with the backlog)
+      - DynamoDB table (on-demand, TTL on raw samples)
+      - Lambda "query"     (read models + the dashboard page)
+      - CloudWatch log groups for all three functions
+  ...then prints the ingest URL, the dashboard URL and the generated API key.
+
+  Point the fog node at the cloud (PowerShell):
+      $env:FOG_INGEST_URL = "https://<api-id>.execute-api.<region>.amazonaws.com/api/ingest"
+      $env:FOG_API_KEY    = "<key printed by the deploy script>"
       python -m fog.node          # in one terminal
       python -m sensors.runner    # in another
 
-  Cloud dashboard: https://<app>.azurewebsites.net/api/dashboard
+  Cloud dashboard:
+      https://<api-id>.execute-api.<region>.amazonaws.com/api/dashboard
+
+  To remove everything afterwards:
+      aws cloudformation delete-stack --stack-name fogedge --region us-east-1
 
 
 --------------------------------------------------------------------------------
@@ -129,7 +151,7 @@ CONTENTS
       fog.thin_raw_to          raw samples retained per window for charting
       fog.anomaly.*            z-score threshold and alert cooldown
 
-  Environment variable overrides (used by Docker and Azure):
+  Environment variable overrides (used by Docker and the cloud run):
       FOG_CONFIG, FOG_INGEST_URL, FOG_API_KEY, FOG_MQTT_HOST,
       BACKEND_DB, QUEUE_WORKERS, QUEUE_MAXSIZE
 
@@ -146,12 +168,25 @@ CONTENTS
 
   Fog node logs "ingest transport error"
         Expected if the backend is down. The batches are being spooled to
-        fog_spool.db and will be replayed automatically once it returns -
-        this is the store-and-forward behaviour and is worth demonstrating.
+        fog_spool.db and will be replayed automatically once it returns.
+        This is the store-and-forward behaviour and is worth demonstrating.
+
+  AWS deploy fails with ExpiredToken
+        Your AWS Academy lab session ended. Start the lab again and re-copy
+        the credentials, including aws_session_token.
+
+  AWS deploy fails with "not authorized to perform: iam:CreateRole"
+        You are on AWS Academy. Re-run the deploy passing -LabRoleArn (or
+        LAB_ROLE_ARN) as shown in section 7.
+
+  Lambda code changes do not appear after a deploy
+        The deploy scripts upload under a new S3 key every run precisely to
+        avoid this. If you deploy by hand, change the key or CloudFormation
+        will see no change and keep the old code.
 
   No anomalies appear
-        Wait ~60 s. The simulated day is compressed to 60 real seconds, and
-        thresholds are only crossed around the simulated afternoon peak.
+        Wait about 60 s. The simulated day is compressed to 60 real seconds,
+        and thresholds are only crossed around the simulated afternoon peak.
 
   Port 8000 already in use
         uvicorn backend.local.main:app --port 8080

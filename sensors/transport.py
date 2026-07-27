@@ -3,7 +3,7 @@ Pluggable transport between the sensor tier and the fog tier.
 
 Two implementations are provided:
 
-* ``MqttTransport``: real MQTT (paho-mqtt) against Mosquitto/Azure IoT Edge.
+* ``MqttTransport``: real MQTT (paho-mqtt) against Mosquitto or AWS IoT Core.
   This is what runs in the containerised demo.
 * ``InProcTransport``: an in-process queue used by unit tests and by the
   single-process demo runner, so the whole pipeline can be exercised on a

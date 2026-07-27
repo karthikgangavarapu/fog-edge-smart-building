@@ -1,0 +1,4 @@
+# boto3 is preinstalled in the Lambda Python runtime, so the deployment
+# package needs no third-party dependencies at all. Listed here for clarity
+# and for local testing only.
+boto3>=1.34.0
